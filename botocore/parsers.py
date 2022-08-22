@@ -115,10 +115,12 @@ Each call to ``parse()`` returns a dict has this form::
 
 """
 import base64
+import calendar
 import json
 import logging
 import re
-
+import urllib
+from collections import defaultdict
 from botocore.compat import ETree, XMLParseError, six
 from botocore.eventstream import EventStream, NoInitialResponseError
 from botocore.utils import (
@@ -1091,6 +1093,651 @@ class RestXMLParser(BaseRestParser, BaseXMLResponseParser):
         text = super()._handle_string(shape, text)
         return text
 
+
+# BRIAN'S BULLSHIT
+
+from botocore import xform_name
+
+# Sentinel to signal the absence of a field in the input
+
+UNDEFINED = object()
+class RequestParser(object):
+    """Base class for response parsing.
+
+    This class represents the interface that all ResponseParsers for the
+    various protocols must implement.
+
+    This class will take an HTTP response and a model shape and parse the
+    HTTP response into a dictionary.
+
+    There is a single public method exposed: ``parse``.  See the ``parse``
+    docstring for more info.
+
+    """
+
+    DEFAULT_ENCODING = "utf-8"
+    EVENT_STREAM_PARSER_CLS = None
+
+    MAP_TYPE = dict
+
+    def __init__(self, timestamp_parser=None, blob_parser=None):
+        if timestamp_parser is None:
+            timestamp_parser = DEFAULT_TIMESTAMP_PARSER
+        self._timestamp_parser = timestamp_parser
+        if blob_parser is None:
+            blob_parser = self._default_blob_parser
+        self._blob_parser = blob_parser
+        self._event_stream_parser = None
+        if self.EVENT_STREAM_PARSER_CLS is not None:
+            self._event_stream_parser = self.EVENT_STREAM_PARSER_CLS(
+                timestamp_parser, blob_parser
+            )
+
+    def _default_blob_parser(self, value):
+        # Blobs are always returned as bytes type (this matters on python3).
+        # We don't decode this to a str because it's entirely possible that the
+        # blob contains binary data that actually can't be decoded.
+        return base64.b64decode(value)
+
+    def _parse_action(self, request_dict, service_model):
+        return NotImplementedError()
+
+    def parse(self, request_dict, service_model):
+        """Parse the HTTP response given a shape.
+
+        :param request_dict: The HTTP response dictionary.  This is a dictionary
+            that represents the HTTP request.  The dictionary must have the
+            following keys, ``body``, ``headers``.
+
+        :param service_model: The model shape describing the expected output.
+        :return: Returns a dictionary representing the parsed response
+            described by the model.  In addition to the shape described from
+            the model, each response will also have a ``ResponseMetadata``
+            which contains metadata about the response, which contains at least
+            two keys containing ``RequestId`` and ``HTTPStatusCode``.  Some
+            responses may populate additional keys, but ``RequestId`` will
+            always be present.
+
+        """
+        action = self._parse_action(request_dict, service_model)
+        operation_model = service_model.operation_model(action)
+        # parsed = {"action": xform_name(action), "kwargs": {}}
+        parsed = {"action": action, "kwargs": {}}
+
+        shape = operation_model.input_shape
+        if shape is None:
+            return parsed
+        parsed["kwargs"] = self._do_parse(request_dict, operation_model.input_shape)
+        return parsed
+
+    def _do_parse(self, request_dict, shape):
+        raise NotImplementedError("%s._do_parse" % self.__class__.__name__)
+
+    def _do_error_parse(self, response, shape):
+        raise NotImplementedError("%s._do_error_parse" % self.__class__.__name__)
+
+    def _parse_shape(self, shape, node):
+        handler = getattr(self, "_handle_%s" % shape.type_name, self._default_handle)
+        return handler(shape, node)
+
+    def _handle_list(self, shape, node):
+        # Enough implementations share list serialization that it's moved
+        # up here in the base class.
+        parsed = []
+        member_shape = shape.member
+        for item in node:
+            parsed.append(self._parse_shape(member_shape, item))
+        return parsed
+
+    def _default_handle(self, shape, value):
+        return value
+
+    def _timestamp_unixtimestamp(self, value):
+        return int(value)
+    def _convert_str_to_timestamp(self, value, timestamp_format=None):
+        if timestamp_format is None:
+            timestamp_format = self.TIMESTAMP_FORMAT
+        timestamp_format = timestamp_format.lower()
+        datetime_obj = parse_to_aware_datetime(value)
+        converter = getattr(self, f'_timestamp_{timestamp_format}')
+        final_value = converter(datetime_obj)
+        return final_value
+
+    def convert_data_to_dict(self, data, encoding=QueryParser.DEFAULT_ENCODING):
+
+        if isinstance(data, bytes):
+            data = data.decode(encoding)
+        #return urllib.parse.parse_qs(data, keep_blank_values=True, encoding=encoding)
+        parsed = urllib.parse.parse_qsl(data, keep_blank_values=True, encoding=encoding)
+        return {i[0]: i[1] for i in parsed}
+
+    def _get_first_key(self, value):
+        return list(value)[0]
+
+    def _has_unknown_tagged_union_member(self, shape, value):
+        if shape.is_tagged_union:
+            if len(value) != 1:
+                error_msg = (
+                    "Invalid service response: %s must have one and only "
+                    "one member set."
+                )
+                raise ResponseParserError(error_msg % shape.name)
+            tag = self._get_first_key(value)
+            if tag not in shape.members:
+                msg = (
+                    "Received a tagged union response with member "
+                    "unknown to client: %s. Please upgrade SDK for full "
+                    "response support."
+                )
+                LOG.info(msg % tag)
+                return True
+        return False
+
+    def _handle_unknown_tagged_union_member(self, tag):
+        return {'SDK_UNKNOWN_MEMBER': {'name': tag}}
+
+
+class QueryParser(RequestParser):
+    TIMESTAMP_FORMAT = 'iso8601'
+    def parse(self, request_dict, service_model):
+        """Parse the HTTP response given a shape.
+
+        :param request_dict: The HTTP response dictionary.  This is a dictionary
+            that represents the HTTP request.  The dictionary must have the
+            following keys, ``body``, ``headers``.
+
+        :param service_model: The model shape describing the expected output.
+        :return: Returns a dictionary representing the parsed response
+            described by the model.  In addition to the shape described from
+            the model, each response will also have a ``ResponseMetadata``
+            which contains metadata about the response, which contains at least
+            two keys containing ``RequestId`` and ``HTTPStatusCode``.  Some
+            responses may populate additional keys, but ``RequestId`` will
+            always be present.
+
+        """
+        action = self._parse_action(request_dict, service_model)
+        operation_model = service_model.operation_model(action)
+        # parsed = {"action": xform_name(action), "kwargs": {}}
+        parsed = {"action": action, "kwargs": {}}
+
+        shape = operation_model.input_shape
+        if shape is None:
+            return parsed
+        parsed["kwargs"] = self._do_parse(request_dict, operation_model.input_shape)
+        return parsed
+
+
+    def _get_data(self, request_dict):
+        method = request_dict.get('method', 'POST')
+        if method == 'GET':
+            return self.convert_data_to_dict(request_dict.get('query_string',''))
+        return self.convert_data_to_dict(request_dict.get('body',''))
+
+    def _parse_action(self, request_dict, service_model):
+        data = self._get_data(request_dict)
+        return data.get("Action","UnknownAction")
+
+    def _do_parse(self, request_dict, shape):
+        return self._parse_shape(shape, self._get_data(request_dict))
+
+    def _parse_shape(self, shape, query_params, prefix=""):
+        handler = getattr(self, "_handle_%s" % shape.type_name, self._default_handle)
+        return handler(shape, query_params, prefix=prefix)
+
+    def _gonna_recurse(self, query_params, prefix):
+        if prefix=='':
+            return False
+        return not any([param_key.startswith(prefix)for param_key in query_params])
+    def _handle_structure(self, shape, query_params, prefix=""):
+        if self._gonna_recurse(query_params, prefix):
+            return UNDEFINED
+        parsed = self.MAP_TYPE()
+        members = shape.members
+        for member_name in members:
+            member_shape = members[member_name]
+            member_prefix = self._get_serialized_name(member_shape, member_name)
+            if prefix:
+                member_prefix = "%s.%s" % (prefix, member_prefix)
+            value = self._parse_shape(
+                member_shape, query_params, member_prefix
+            )
+            parsed_key = self._parsed_key_name(member_name)
+            if value is not UNDEFINED:
+                parsed[parsed_key] = value
+        return parsed if parsed != {} else UNDEFINED
+
+    def _handle_list(self, shape, query_params, prefix=""):
+        # The query protocol serializes empty lists as an empty string.
+        value = self._parse_shape(shape.member, query_params, prefix)
+        if value == '':
+            return []
+
+        if self._is_shape_flattened(shape):
+            list_prefix = prefix
+            if shape.member.serialization.get('name'):
+                name = self._get_serialized_name(shape.member,default_name='')
+                # Replace '.Original' with '.{name}'.
+                list_prefix = '.'.join(prefix.split('.')[:-1] + [name])
+        else:
+            list_name = shape.member.serialization.get('name', 'member')
+            list_prefix = f'{prefix}.{list_name}'
+        parsed_list = []
+        i = 1
+        while True:
+            element_name = f'{list_prefix}.{i}'
+            element_shape = shape.member
+            value = self._parse_shape(element_shape, query_params, element_name)
+            if value is UNDEFINED:
+                break
+            parsed_list.append(value)
+            i += 1
+        return parsed_list if parsed_list != [] else UNDEFINED
+
+    def _handle_map(self, shape, query_params, prefix=""):
+        if self._is_shape_flattened(shape):
+            full_prefix = prefix
+        else:
+            full_prefix = f'{prefix}.entry'
+        template = full_prefix + '.{i}.{suffix}'
+        key_shape = shape.key
+        value_shape = shape.value
+        key_suffix = self._get_serialized_name(key_shape, default_name='key')
+        value_suffix = self._get_serialized_name(value_shape, 'value')
+        parsed_map = self.MAP_TYPE()
+        i = 1
+        while True:
+            key_name = template.format(i=i, suffix=key_suffix)
+            value_name = template.format(i=i, suffix=value_suffix)
+            key = self._parse_shape(key_shape, query_params, key_name)
+            value = self._parse_shape(value_shape, query_params, value_name)
+            if key is UNDEFINED:
+                break
+            parsed_map[key] = value
+            i += 1
+        return parsed_map if parsed_map != {} else UNDEFINED
+
+    def _handle_blob(self, shape, query_params, prefix=''):
+        # Blob args must be base64 encoded.
+        value = self._default_handle(shape, query_params, prefix)
+        if value is UNDEFINED:
+            return value
+        return self._default_blob_parser(value)
+
+    def _handle_timestamp(self, shape, query_params, prefix=''):
+        value = self._default_handle(shape, query_params, prefix)
+        return self._timestamp_parser(value)
+        #return self._convert_str_to_timestamp(value)
+    def _handle_boolean(self, shape, query_params, prefix=""):
+        value = self._default_handle(shape, query_params, prefix)
+        if value is True or value is False:
+            return value
+        try:
+            return value.lower() == "true"
+        except AttributeError:
+            pass
+        return UNDEFINED
+
+    def _handle_integer(self, shape, query_params, prefix=""):
+        value = self._default_handle(shape, query_params, prefix)
+        return int(value)
+
+    def _default_handle(self, shape, query_params, prefix=""):
+        return query_params.get(prefix, shape.metadata.get("default",UNDEFINED))
+
+    def _get_serialized_name(self, shape, default_name):
+        return shape.serialization.get("name", default_name)
+
+    def _parsed_key_name(self, member_name):
+        key_name = member_name
+        #key_name = xform_name(key_name)
+        return key_name
+
+    def _has_member(self, value, member_prefix):
+        return any(i for i in value if i.startswith(member_prefix))
+
+    def _is_shape_flattened(self, shape):
+        return shape.serialization.get('flattened')
+
+
+
+
+class EC2QueryParser(QueryParser):
+    """EC2 specific customizations to the query protocol serializers.
+
+    The EC2 model is almost, but not exactly, similar to the query protocol
+    serializer.  This class encapsulates those differences.  The model
+    will have be marked with a ``protocol`` of ``ec2``, so you don't need
+    to worry about wiring this class up correctly.
+
+    """
+
+    def _get_serialized_name(self, shape, default_name):
+        if 'queryName' in shape.serialization:
+            return shape.serialization['queryName']
+        elif 'name' in shape.serialization:
+            # A locationName is always capitalized
+            # on input for the ec2 protocol.
+            name = shape.serialization['name']
+            return name[0].upper() + name[1:]
+        else:
+            return default_name
+
+    def _handle_list(self, shape, query_params, prefix=""):
+        parsed_list = []
+        i = 1
+        while True:
+            element_name = f'{prefix}.{i}'
+            element_shape = shape.member
+            value = self._parse_shape(element_shape, query_params, element_name)
+            if value is UNDEFINED:
+                break
+            parsed_list.append(value)
+            i += 1
+        return parsed_list if parsed_list != [] else UNDEFINED
+
+
+class BaseJSONParser(RequestParser):
+    def _handle_structure(self, shape, value):
+        if shape.is_document_type:
+            final_parsed = value
+        else:
+            member_shapes = shape.members
+            if value is None:
+                # If the comes across the wire as "null" (None in python),
+                # we should be returning this unchanged, instead of as an
+                # empty dict.
+                return None
+            final_parsed = {}
+            if self._has_unknown_tagged_union_member(shape, value):
+                tag = self._get_first_key(value)
+                return self._handle_unknown_tagged_union_member(tag)
+            for member_name in member_shapes:
+                member_shape = member_shapes[member_name]
+                json_name = member_shape.serialization.get('name', member_name)
+                raw_value = value.get(json_name)
+                if raw_value is not None:
+                    final_parsed[member_name] = self._parse_shape(
+                        member_shapes[member_name], raw_value
+                    )
+        return final_parsed
+
+    def _handle_map(self, shape, value):
+        parsed = {}
+        key_shape = shape.key
+        value_shape = shape.value
+        for key, value in value.items():
+            actual_key = self._parse_shape(key_shape, key)
+            actual_value = self._parse_shape(value_shape, value)
+            parsed[actual_key] = actual_value
+        return parsed
+
+    def _handle_blob(self, shape, value):
+        return self._blob_parser(value)
+
+    def _handle_timestamp(self, shape, value):
+        return self._timestamp_parser(value)
+
+    def _parse_body_as_json(self, body_contents):
+        if not body_contents:
+            return {}
+        body = body_contents.decode(self.DEFAULT_ENCODING)
+        try:
+            original_parsed = json.loads(body)
+            return original_parsed
+        except ValueError:
+            # if the body cannot be parsed, include
+            # the literal string as the message
+            return {'message': body}
+
+
+class JSONParser(BaseJSONParser):
+
+    def _parse_action(self, request_dict, service_model):
+        headers = request_dict['headers']
+        target = headers.get('X-Amz-Target', 'UnknownOperation')
+        target_prefix = service_model.metadata.get('targetPrefix')
+        if target_prefix:
+            target = target.replace(f"{target_prefix}.","")
+        return target
+
+    def _get_data(self, request_dict):
+        method = request_dict.get('method', 'POST')
+        if method == 'GET':
+            return self.convert_data_to_dict(request_dict.get('query_string',''))
+        return self.convert_data_to_dict(request_dict.get('body',''))
+
+    def _do_parse(self, request_dict, shape):
+        parsed = {}
+        if shape is not None:
+            # event_name = shape.event_stream_name
+            # if event_name:
+            #     parsed = self._handle_event_stream(response, shape, event_name)
+            # else:
+            parsed = self._handle_json_body(request_dict['body'], shape)
+        return parsed
+
+    def _handle_json_body(self, raw_body, shape):
+        # The json.loads() gives us the primitive JSON types,
+        # but we need to traverse the parsed JSON data to convert
+        # to richer types (blobs, timestamps, etc.
+        parsed_json = self._parse_body_as_json(raw_body)
+        return self._parse_shape(shape, parsed_json)
+
+
+class BaseRestParser(RequestParser):
+
+    def convert_data_to_dict(self, data, encoding=QueryParser.DEFAULT_ENCODING):
+
+        if isinstance(data, bytes):
+            data = data.decode(encoding)
+        parsed = urllib.parse.parse_qs(data, keep_blank_values=True, encoding=encoding)
+        parsed = {k: v if len(v) > 1 else v[0] for k,v in parsed.items()}
+        return parsed
+
+    def uri_to_regexp(self, uri):
+        """converts uri w/ placeholder to regexp
+          '/cars/{carName}/drivers/{DriverName}'
+        -> '^/cars/.*/drivers/[^/]*$'
+
+          '/cars/{carName}/drivers/{DriverName}/drive'
+        -> '^/cars/.*/drivers/.*/drive$'
+
+        """
+
+        def _convert(elem, is_last):
+            if not re.match("^{.*}$", elem):
+                return elem
+            name = (
+                elem.replace("{", "")
+                .replace("}", "")
+                .replace("+", "")
+                .replace("-", "_")
+            )
+            if is_last:
+                return "(?P<%s>[^/]+)" % name
+            return "(?P<%s>.*)" % name
+
+        elems = uri.split("/")
+        num_elems = len(elems)
+        regexp = "^{}$".format(
+            "/".join(
+                [_convert(elem, (i == num_elems - 1)) for i, elem in enumerate(elems)]
+            )
+        )
+        return regexp
+
+    def _parse_action(self, request_dict, service_model):
+        # Should put this elsewhere...
+        if 'query_string' in request_dict:
+            request_dict['query_string'] = self.convert_data_to_dict(request_dict.get('query_string', ''))
+
+        method_urls = defaultdict(lambda: defaultdict(str))
+        op_names = service_model.operation_names
+        for op_name in op_names:
+            op_model = service_model.operation_model(op_name)
+            _method = op_model.http["method"]
+            parsed_uri = urllib.parse.urlparse(op_model.http["requestUri"])
+            uri_regexp = self.uri_to_regexp(parsed_uri.path)
+            method_urls[_method][uri_regexp] = op_model.name
+        regexp_and_names = method_urls[request_dict['method']]
+        for regexp, name in regexp_and_names.items():
+            match = re.match(regexp, request_dict['url_path'])
+            self.uri_match = match
+            if match:
+                return name
+        return 'UnknownOperation'
+
+    def _do_parse(self, request_dict, shape):
+        final_parsed = {}
+        self._add_modeled_parse(request_dict, shape, final_parsed)
+        return final_parsed
+
+    def _add_modeled_parse(self, request_dict, shape, final_parsed):
+        if shape is None:
+            return final_parsed
+        member_shapes = shape.members
+        self._parse_non_payload_attrs(
+            request_dict, shape, member_shapes, final_parsed
+        )
+        self._parse_payload(request_dict, shape, member_shapes, final_parsed)
+
+
+
+
+
+    def _parse_payload(self, response, shape, member_shapes, final_parsed):
+        if 'payload' in shape.serialization:
+            # If a payload is specified in the output shape, then only that
+            # shape is used for the body payload.
+            payload_member_name = shape.serialization['payload']
+            body_shape = member_shapes[payload_member_name]
+            if body_shape.serialization.get('eventstream'):
+                body = self._create_event_stream(response, body_shape)
+                final_parsed[payload_member_name] = body
+            elif body_shape.type_name in ['string', 'blob']:
+                # This is a stream
+                body = response['body']
+                if isinstance(body, bytes):
+                    body = body.decode(self.DEFAULT_ENCODING)
+                if body != '':
+                    final_parsed[payload_member_name] = body
+            else:
+                original_parsed = self._initial_body_parse(response['body'])
+                value = self._parse_shape(
+                    body_shape, original_parsed
+                )
+                if value:
+                    final_parsed[payload_member_name]=value
+        else:
+            original_parsed = self._initial_body_parse(response['body'])
+            body_parsed = self._parse_shape(shape, original_parsed)
+            final_parsed.update(body_parsed)
+
+    def _parse_non_payload_attrs(
+        self, response, shape, member_shapes, final_parsed
+    ):
+        headers = response['headers']
+        for name in member_shapes:
+            member_shape = member_shapes[name]
+            location = member_shape.serialization.get('location')
+            if location is None:
+                continue
+            elif location == 'statusCode':
+                final_parsed[name] = self._parse_shape(
+                    member_shape, response['status_code']
+                )
+            elif location == 'headers':
+                final_parsed[name] = self._parse_header_map(
+                    member_shape, headers
+                )
+            elif location == 'header':
+                header_name = member_shape.serialization.get('name', name)
+                if header_name in headers:
+                    final_parsed[name] = self._parse_shape(
+                        member_shape, headers[header_name]
+                    )
+            elif location == 'uri':
+                member_name = member_shape.serialization.get('name', name)
+                if self.uri_match:
+                    try:
+                        value = self.uri_match.group(member_name)
+                        final_parsed[name] = self._parse_shape(member_shape, value)
+                    except IndexError:
+                        # do nothing if param is not found
+                        pass
+            elif location == 'querystring':
+                qs = response['query_string']
+                if qs == '':
+                    return
+                member_name = member_shape.serialization.get('name', name)
+                value = None
+                if member_shape.type_name == 'list':
+                    value = qs.get(member_name,[])
+                elif member_shape.type_name == 'map':
+                    value = qs
+                else:
+                    value = qs.get(member_name)
+                if value is None:
+                    return
+                final_parsed[name] = self._parse_shape(member_shape, value)
+
+    def _parse_header_map(self, shape, headers):
+        # Note that headers are case-insensitive, so we .lower()
+        # all header names and header prefixes.
+        parsed = self.MAP_TYPE()
+        prefix = shape.serialization.get('name', '').lower()
+        for header_name in headers:
+            if header_name.lower().startswith(prefix):
+                # The key name inserted into the parsed hash
+                # strips off the prefix.
+                name = header_name[len(prefix) :]
+                parsed[name] = headers[header_name]
+        return parsed
+
+    def _initial_body_parse(self, body_contents):
+        # This method should do the initial xml/json parsing of the
+        # body.  We still need to walk the parsed body in order
+        # to convert types, but this method will do the first round
+        # of parsing.
+        raise NotImplementedError("_initial_body_parse")
+
+    def _handle_string(self, shape, value):
+        parsed = value
+        if is_json_value_header(shape):
+            decoded = base64.b64decode(value).decode(self.DEFAULT_ENCODING)
+            parsed = json.loads(decoded)
+        return parsed
+
+    def _handle_list(self, shape, node):
+        location = shape.serialization.get('location')
+        if location == 'header' and not isinstance(node, list):
+            # List in headers may be a comma separated string as per RFC7230
+            node = [e.strip() for e in node.split(',')]
+        return super()._handle_list(shape, node)
+
+    def _handle_boolean(self, shape, value):
+        if value is True or value is False:
+            return value
+        try:
+            return value.lower() == "true"
+        except AttributeError:
+            pass
+        return UNDEFINED
+
+class RestJSONParser(BaseRestParser, BaseJSONParser):
+
+    EVENT_STREAM_PARSER_CLS = EventStreamJSONParser
+
+
+
+    def _initial_body_parse(self, body_contents):
+        return self._parse_body_as_json(body_contents)
+
+    def _handle_integer(self, shape, value):
+        return int(value)
+
+    _handle_long = _handle_integer
 
 PROTOCOL_PARSERS = {
     'ec2': EC2QueryParser,
