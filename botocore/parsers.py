@@ -10,7 +10,7 @@
 # distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF
 # ANY KIND, either express or implied. See the License for the specific
 # language governing permissions and limitations under the License.
-"""Response parsers for the various protocol types.
+"""Request parsers for the various protocol types.
 
 The module contains classes that can take an HTTP response, and given
 an output shape, parse the response into a dict according to the
@@ -1207,9 +1207,9 @@ class RequestParser(object):
 
         if isinstance(data, bytes):
             data = data.decode(encoding)
-        #return urllib.parse.parse_qs(data, keep_blank_values=True, encoding=encoding)
-        parsed = urllib.parse.parse_qsl(data, keep_blank_values=True, encoding=encoding)
-        return {i[0]: i[1] for i in parsed}
+        parsed = urllib.parse.parse_qs(data, keep_blank_values=True, encoding=encoding)
+        parsed = {k: v if len(v) > 1 else v[0] for k, v in parsed.items()}
+        return parsed
 
     def _get_first_key(self, value):
         return list(value)[0]
@@ -1527,13 +1527,13 @@ class JSONParser(BaseJSONParser):
 
 class BaseRestParser(RequestParser):
 
-    def convert_data_to_dict(self, data, encoding=QueryParser.DEFAULT_ENCODING):
-
-        if isinstance(data, bytes):
-            data = data.decode(encoding)
-        parsed = urllib.parse.parse_qs(data, keep_blank_values=True, encoding=encoding)
-        parsed = {k: v if len(v) > 1 else v[0] for k,v in parsed.items()}
-        return parsed
+    # def convert_data_to_dict(self, data, encoding=QueryParser.DEFAULT_ENCODING):
+    #
+    #     if isinstance(data, bytes):
+    #         data = data.decode(encoding)
+    #     parsed = urllib.parse.parse_qs(data, keep_blank_values=True, encoding=encoding)
+    #     parsed = {k: v if len(v) > 1 else v[0] for k,v in parsed.items()}
+    #     return parsed
 
     def uri_to_regexp(self, uri):
         """converts uri w/ placeholder to regexp

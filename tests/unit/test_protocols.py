@@ -129,7 +129,7 @@ def _compliance_tests(test_type=None):
                 if model.get('description') in PROTOCOL_TEST_BLACKLIST:
                     continue
                 if 'params' in case and inp:
-                    test_name = '{}-protocol-{}-'.format(model['metadata']['protocol'],case['description'])
+                    test_name = '{}-protocol-{}'.format(model['metadata']['protocol'],case['description'])
                     yield pytest.param(model, case, basename, id=test_name)
                 elif 'response' in case and out:
                     yield model, case, basename
