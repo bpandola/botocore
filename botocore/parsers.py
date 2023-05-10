@@ -1035,8 +1035,8 @@ class RestXMLParser(BaseRestParser, BaseXMLParser):
 
 PROTOCOL_PARSERS = {
     'ec2': EC2QueryParser,
-    'query': QueryParser,
     'json': JSONParser,
+    'query': QueryParser,
     'rest-json': RestJSONParser,
     'rest-xml': RestXMLParser,
 }
